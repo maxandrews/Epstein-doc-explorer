@@ -19,30 +19,62 @@ import os
 import sqlite3
 import json
 import numpy as np
+import httpx
 from pathlib import Path
 from typing import Any, Optional
-from sentence_transformers import SentenceTransformer
 from mcp.server.fastmcp import FastMCP
 
 # Database configuration
 DATABASE_URL = os.environ.get("DATABASE_URL")
 SQLITE_PATH = Path(__file__).parent / "document_analysis.db"
-MODEL_NAME = "all-MiniLM-L6-v2"
+MODEL_NAME = "sentence-transformers/all-minilm-l6-v2"
 EMBEDDING_DIM = 384
+
+# OpenRouter API configuration
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_EMBEDDING_URL = "https://openrouter.ai/api/v1/embeddings"
 
 # Initialize MCP server
 mcp = FastMCP("epstein-docs")
 
-# Global model (lazy loaded)
-_model: SentenceTransformer | None = None
 
+def get_embeddings(texts: list[str]) -> np.ndarray:
+    """
+    Get embeddings via OpenRouter API.
 
-def get_model() -> SentenceTransformer:
-    """Lazy load the embedding model."""
-    global _model
-    if _model is None:
-        _model = SentenceTransformer(MODEL_NAME)
-    return _model
+    Args:
+        texts: List of texts to embed
+
+    Returns:
+        numpy array of embeddings (shape: [n_texts, 384])
+    """
+    if not OPENROUTER_API_KEY:
+        raise ValueError("OPENROUTER_API_KEY environment variable not set")
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://epstein-agent-api.local",
+    }
+
+    payload = {
+        "model": MODEL_NAME,
+        "input": texts
+    }
+
+    with httpx.Client(timeout=30.0) as client:
+        response = client.post(
+            OPENROUTER_EMBEDDING_URL,
+            headers=headers,
+            json=payload
+        )
+        response.raise_for_status()
+
+    result = response.json()
+
+    # Extract embeddings from response
+    embeddings = [item["embedding"] for item in result["data"]]
+    return np.array(embeddings, dtype=np.float32)
 
 
 def get_db():
@@ -90,11 +122,10 @@ def semantic_search_pgvector(query: str, limit: int = 10) -> list[dict]:
     Returns:
         List of documents with similarity scores (0-1)
     """
-    model = get_model()
     conn = get_db()
 
-    # Embed the query
-    query_embedding = model.encode([query])[0].astype(np.float32)
+    # Embed the query via OpenRouter API
+    query_embedding = get_embeddings([query])[0]
     query_vector_str = str(query_embedding.tolist())
 
     cursor = conn.cursor()
@@ -134,11 +165,10 @@ def semantic_search_fallback(query: str, limit: int = 10) -> list[dict]:
     Note: This loads all embeddings and calculates similarity in Python.
     Not recommended for large datasets - use PGVector instead.
     """
-    model = get_model()
     conn = get_db()
 
-    # Embed the query
-    query_embedding = model.encode([query])[0].astype(np.float32)
+    # Embed the query via OpenRouter API
+    query_embedding = get_embeddings([query])[0]
 
     cursor = conn.cursor()
     cursor.execute("""

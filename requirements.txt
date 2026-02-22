@@ -1,6 +1,6 @@
 # MCP Server dependencies
 mcp
-sentence-transformers
+httpx>=0.27.0
 numpy
 
 # LangGraph Agent dependencies
