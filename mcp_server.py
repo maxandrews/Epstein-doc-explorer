@@ -77,6 +77,47 @@ def get_embeddings(texts: list[str]) -> np.ndarray:
     return np.array(embeddings, dtype=np.float32)
 
 
+_pg_pool = None
+
+
+def _init_pg_pool():
+    """Initialize PostgreSQL connection pool."""
+    global _pg_pool
+    if _pg_pool is None and DATABASE_URL:
+        import psycopg2.pool
+        _pg_pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=2,
+            maxconn=10,
+            dsn=DATABASE_URL
+        )
+    return _pg_pool
+
+
+class PooledConnection:
+    """Wrapper that returns connection to pool on close()."""
+
+    def __init__(self, pool, conn):
+        self._pool = pool
+        self._conn = conn
+        import psycopg2.extras
+        self._conn.cursor_factory = psycopg2.extras.RealDictCursor
+
+    def cursor(self):
+        return self._conn.cursor()
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+    def close(self):
+        """Return connection to pool instead of closing."""
+        if self._pool and self._conn:
+            self._pool.putconn(self._conn)
+            self._conn = None
+
+
 def get_db():
     """Get database connection (SQLite or PostgreSQL)."""
     if DATABASE_URL:
@@ -88,13 +129,18 @@ def get_db():
 
 
 def _get_postgres_conn():
-    """Get PostgreSQL connection."""
-    import psycopg2
-    import psycopg2.extras
-
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.cursor_factory = psycopg2.extras.RealDictCursor
-    return conn
+    """Get PostgreSQL connection from pool."""
+    pool = _init_pg_pool()
+    if pool:
+        conn = pool.getconn()
+        return PooledConnection(pool, conn)
+    else:
+        # Fallback si pas de pool
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.cursor_factory = psycopg2.extras.RealDictCursor
+        return conn
 
 
 def _is_postgres():

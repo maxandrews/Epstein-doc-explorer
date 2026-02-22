@@ -557,7 +557,7 @@ async def get_document_endpoint(doc_id: str, _: str = Depends(verify_api_key)):
 
 
 _stats_cache = {"data": None, "timestamp": 0}
-STATS_CACHE_TTL = 300  # 5 minutes
+STATS_CACHE_TTL = 604800  # 1 semaine
 
 
 def _get_stats_sync():
