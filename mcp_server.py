@@ -18,6 +18,7 @@ Features:
 import os
 import sqlite3
 import json
+import time
 import numpy as np
 import httpx
 from pathlib import Path
@@ -36,6 +37,10 @@ OPENROUTER_EMBEDDING_URL = "https://openrouter.ai/api/v1/embeddings"
 
 # Initialize MCP server
 mcp = FastMCP("epstein-docs")
+
+# Stats cache (1 week TTL)
+_stats_cache = {"data": None, "timestamp": 0}
+STATS_CACHE_TTL = 7 * 24 * 60 * 60  # 1 week in seconds
 
 
 def get_embeddings(texts: list[str]) -> np.ndarray:
@@ -719,11 +724,17 @@ def search_actor(actor_name: str, limit: int = 50) -> str:
 @mcp.tool()
 def get_stats() -> str:
     """
-    Get database statistics.
+    Get database statistics (cached for 1 week).
 
     Returns:
         Total documents, relationships, actors, and search capabilities.
     """
+    global _stats_cache
+
+    # Check cache
+    if _stats_cache["data"] and (time.time() - _stats_cache["timestamp"]) < STATS_CACHE_TTL:
+        return _stats_cache["data"]
+
     conn = get_db()
 
     stats = {
@@ -744,7 +755,12 @@ def get_stats() -> str:
     stats["categories"] = [{"name": row[0], "count": row[1]} for row in cursor]
 
     conn.close()
-    return json.dumps(stats, indent=2)
+
+    # Update cache
+    result = json.dumps(stats, indent=2)
+    _stats_cache = {"data": result, "timestamp": time.time()}
+
+    return result
 
 
 @mcp.tool()
