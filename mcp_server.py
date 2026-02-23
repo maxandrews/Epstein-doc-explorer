@@ -106,6 +106,9 @@ class PooledConnection:
         self._conn = conn
         import psycopg2.extras
         self._conn.cursor_factory = psycopg2.extras.RealDictCursor
+        # Set IVFFlat probes for better semantic search quality
+        with self._conn.cursor() as cur:
+            cur.execute("SET ivfflat.probes = 10")
 
     def cursor(self):
         return self._conn.cursor()
@@ -145,6 +148,9 @@ def _get_postgres_conn():
         import psycopg2.extras
         conn = psycopg2.connect(DATABASE_URL)
         conn.cursor_factory = psycopg2.extras.RealDictCursor
+        # Set IVFFlat probes for better semantic search quality
+        with conn.cursor() as cur:
+            cur.execute("SET ivfflat.probes = 10")
         return conn
 
 
@@ -290,20 +296,20 @@ def keyword_search_postgres(keywords: list[str], limit: int = 10) -> list[dict]:
     # Using & for AND, | for OR
     tsquery = " & ".join([f"'{kw}'" for kw in keywords])
 
-    # Requête optimisée : échantillonnage de 500 candidats puis ranking
-    # Évite de scanner tous les résultats (60k+) pour les termes fréquents
+    # Optimized: sample 500 candidates with all needed columns in one scan
+    # Then sort and limit - avoids expensive JOIN
     cursor.execute("""
-        WITH candidates AS (
-            SELECT doc_id, ts_rank(text_search_vector, to_tsquery('english', %s)) as rank
+        SELECT doc_id, paragraph_summary, one_sentence_summary,
+               category, date_range_earliest, date_range_latest, rank
+        FROM (
+            SELECT doc_id, paragraph_summary, one_sentence_summary,
+                   category, date_range_earliest, date_range_latest,
+                   ts_rank(text_search_vector, to_tsquery('english', %s)) as rank
             FROM all_embeddings_mv
             WHERE text_search_vector @@ to_tsquery('english', %s)
             LIMIT 500
-        )
-        SELECT m.doc_id, m.paragraph_summary, m.one_sentence_summary,
-               m.category, m.date_range_earliest, m.date_range_latest, c.rank
-        FROM candidates c
-        JOIN all_embeddings_mv m ON m.doc_id = c.doc_id
-        ORDER BY c.rank DESC
+        ) AS candidates
+        ORDER BY rank DESC
         LIMIT %s
     """, [tsquery, tsquery, limit])
 
@@ -608,24 +614,40 @@ def get_document_with_metadata(doc_id: str) -> dict | None:
 
 def get_relationships_for_actor(actor: str, limit: int = 50) -> list[dict]:
     """Get relationships involving an actor."""
+    # Trigram index requires at least 3 characters for efficiency
+    if len(actor.strip()) < 3:
+        return []
+
     conn = get_db()
     cursor = conn.cursor()
 
     if _is_postgres():
-        # Requête optimisée avec UNION pour utiliser les index trigram
+        # Optimized query: fetch limited candidates first, then deduplicate
+        # This avoids sorting millions of rows when search term is common
         cursor.execute("""
+            WITH actor_matches AS (
+                SELECT doc_id, timestamp, actor, action, target, location, explicit_topic, implicit_topic
+                FROM rdf_triples
+                WHERE actor ILIKE %s
+                LIMIT %s
+            ),
+            target_matches AS (
+                SELECT doc_id, timestamp, actor, action, target, location, explicit_topic, implicit_topic
+                FROM rdf_triples
+                WHERE target ILIKE %s
+                LIMIT %s
+            ),
+            combined AS (
+                SELECT * FROM actor_matches
+                UNION
+                SELECT * FROM target_matches
+            )
             SELECT DISTINCT ON (doc_id)
                 doc_id, timestamp, actor, action, target, location, explicit_topic, implicit_topic
-            FROM (
-                SELECT doc_id, timestamp, actor, action, target, location, explicit_topic, implicit_topic
-                FROM rdf_triples WHERE actor ILIKE %s
-                UNION ALL
-                SELECT doc_id, timestamp, actor, action, target, location, explicit_topic, implicit_topic
-                FROM rdf_triples WHERE target ILIKE %s
-            ) AS sub
+            FROM combined
             ORDER BY doc_id, timestamp
             LIMIT %s
-        """, [f"%{actor}%", f"%{actor}%", limit])
+        """, [f"%{actor}%", limit * 2, f"%{actor}%", limit * 2, limit])
     else:
         cursor.execute("""
             SELECT DISTINCT doc_id, timestamp, actor, action, target, location, explicit_topic, implicit_topic
