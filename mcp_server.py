@@ -42,10 +42,15 @@ mcp = FastMCP("epstein-docs")
 _stats_cache = {"data": None, "timestamp": 0}
 STATS_CACHE_TTL = 7 * 24 * 60 * 60  # 1 week in seconds
 
+# Embeddings cache (1 hour TTL, max 1000 entries)
+_embeddings_cache: dict[str, tuple[np.ndarray, float]] = {}
+EMBEDDINGS_CACHE_TTL = 60 * 60  # 1 hour
+EMBEDDINGS_CACHE_MAX_SIZE = 1000
+
 
 def get_embeddings(texts: list[str]) -> np.ndarray:
     """
-    Get embeddings via OpenRouter API.
+    Get embeddings via OpenRouter API with caching.
 
     Args:
         texts: List of texts to embed
@@ -53,6 +58,19 @@ def get_embeddings(texts: list[str]) -> np.ndarray:
     Returns:
         numpy array of embeddings (shape: [n_texts, 384])
     """
+    global _embeddings_cache
+    now = time.time()
+
+    # Check cache for single text queries (most common case)
+    if len(texts) == 1:
+        cache_key = texts[0].strip().lower()
+        if cache_key in _embeddings_cache:
+            cached_embedding, cached_time = _embeddings_cache[cache_key]
+            if now - cached_time < EMBEDDINGS_CACHE_TTL:
+                return cached_embedding.reshape(1, -1)
+            else:
+                del _embeddings_cache[cache_key]
+
     if not OPENROUTER_API_KEY:
         raise ValueError("OPENROUTER_API_KEY environment variable not set")
 
@@ -79,7 +97,18 @@ def get_embeddings(texts: list[str]) -> np.ndarray:
 
     # Extract embeddings from response
     embeddings = [item["embedding"] for item in result["data"]]
-    return np.array(embeddings, dtype=np.float32)
+    embeddings_array = np.array(embeddings, dtype=np.float32)
+
+    # Cache single text queries
+    if len(texts) == 1:
+        cache_key = texts[0].strip().lower()
+        # Evict old entries if cache is full
+        if len(_embeddings_cache) >= EMBEDDINGS_CACHE_MAX_SIZE:
+            oldest_key = min(_embeddings_cache, key=lambda k: _embeddings_cache[k][1])
+            del _embeddings_cache[oldest_key]
+        _embeddings_cache[cache_key] = (embeddings_array[0], now)
+
+    return embeddings_array
 
 
 _pg_pool = None
