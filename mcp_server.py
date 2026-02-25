@@ -18,6 +18,7 @@ Features:
 import os
 import sqlite3
 import json
+import time
 import numpy as np
 import httpx
 from pathlib import Path
@@ -37,10 +38,18 @@ OPENROUTER_EMBEDDING_URL = "https://openrouter.ai/api/v1/embeddings"
 # Initialize MCP server
 mcp = FastMCP("epstein-docs")
 
+# Stats cache (1 week TTL)
+_stats_cache = {"data": None, "timestamp": 0}
+STATS_CACHE_TTL = 7 * 24 * 60 * 60  # 1 week in seconds
+
+# Embeddings cache (1 hour TTL, max 1000 entries)
+_embeddings_cache: dict[str, tuple[np.ndarray, float]] = {}
+EMBEDDINGS_CACHE_TTL = 60 * 60  # 1 hour
+EMBEDDINGS_CACHE_MAX_SIZE = 1000
 
 def get_embeddings(texts: list[str]) -> np.ndarray:
     """
-    Get embeddings via OpenRouter API.
+    Get embeddings via OpenRouter API with caching.
 
     Args:
         texts: List of texts to embed
@@ -48,6 +57,19 @@ def get_embeddings(texts: list[str]) -> np.ndarray:
     Returns:
         numpy array of embeddings (shape: [n_texts, 384])
     """
+    global _embeddings_cache
+    now = time.time()
+
+    # Check cache for single text queries (most common case)
+    if len(texts) == 1:
+        cache_key = texts[0].strip().lower()
+        if cache_key in _embeddings_cache:
+            cached_embedding, cached_time = _embeddings_cache[cache_key]
+            if now - cached_time < EMBEDDINGS_CACHE_TTL:
+                return cached_embedding.reshape(1, -1)
+            else:
+                del _embeddings_cache[cache_key]
+
     if not OPENROUTER_API_KEY:
         raise ValueError("OPENROUTER_API_KEY environment variable not set")
 
@@ -74,7 +96,62 @@ def get_embeddings(texts: list[str]) -> np.ndarray:
 
     # Extract embeddings from response
     embeddings = [item["embedding"] for item in result["data"]]
-    return np.array(embeddings, dtype=np.float32)
+    embeddings_array = np.array(embeddings, dtype=np.float32)
+
+    # Cache single text queries
+    if len(texts) == 1:
+        cache_key = texts[0].strip().lower()
+        # Evict old entries if cache is full
+        if len(_embeddings_cache) >= EMBEDDINGS_CACHE_MAX_SIZE:
+            oldest_key = min(_embeddings_cache, key=lambda k: _embeddings_cache[k][1])
+            del _embeddings_cache[oldest_key]
+        _embeddings_cache[cache_key] = (embeddings_array[0], now)
+
+    return embeddings_array
+
+
+_pg_pool = None
+
+
+def _init_pg_pool():
+    """Initialize PostgreSQL connection pool."""
+    global _pg_pool
+    if _pg_pool is None and DATABASE_URL:
+        import psycopg2.pool
+        _pg_pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=2,
+            maxconn=10,
+            dsn=DATABASE_URL
+        )
+    return _pg_pool
+
+
+class PooledConnection:
+    """Wrapper that returns connection to pool on close()."""
+
+    def __init__(self, pool, conn):
+        self._pool = pool
+        self._conn = conn
+        import psycopg2.extras
+        self._conn.cursor_factory = psycopg2.extras.RealDictCursor
+        # Set IVFFlat probes for better semantic search quality
+        with self._conn.cursor() as cur:
+            cur.execute("SET ivfflat.probes = 10")
+
+    def cursor(self):
+        return self._conn.cursor()
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+    def close(self):
+        """Return connection to pool instead of closing."""
+        if self._pool and self._conn:
+            self._pool.putconn(self._conn)
+            self._conn = None
 
 
 def get_db():
@@ -88,13 +165,21 @@ def get_db():
 
 
 def _get_postgres_conn():
-    """Get PostgreSQL connection."""
-    import psycopg2
-    import psycopg2.extras
-
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.cursor_factory = psycopg2.extras.RealDictCursor
-    return conn
+    """Get PostgreSQL connection from pool."""
+    pool = _init_pg_pool()
+    if pool:
+        conn = pool.getconn()
+        return PooledConnection(pool, conn)
+    else:
+        # Fallback si pas de pool
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.cursor_factory = psycopg2.extras.RealDictCursor
+        # Set IVFFlat probes for better semantic search quality
+        with conn.cursor() as cur:
+            cur.execute("SET ivfflat.probes = 10")
+        return conn
 
 
 def _is_postgres():
@@ -239,20 +324,20 @@ def keyword_search_postgres(keywords: list[str], limit: int = 10) -> list[dict]:
     # Using & for AND, | for OR
     tsquery = " & ".join([f"'{kw}'" for kw in keywords])
 
-    # Requête optimisée : échantillonnage de 500 candidats puis ranking
-    # Évite de scanner tous les résultats (60k+) pour les termes fréquents
+    # Optimized: sample 500 candidates with all needed columns in one scan
+    # Then sort and limit - avoids expensive JOIN
     cursor.execute("""
-        WITH candidates AS (
-            SELECT doc_id, ts_rank(text_search_vector, to_tsquery('english', %s)) as rank
+        SELECT doc_id, paragraph_summary, one_sentence_summary,
+               category, date_range_earliest, date_range_latest, rank
+        FROM (
+            SELECT doc_id, paragraph_summary, one_sentence_summary,
+                   category, date_range_earliest, date_range_latest,
+                   ts_rank(text_search_vector, to_tsquery('english', %s)) as rank
             FROM all_embeddings_mv
             WHERE text_search_vector @@ to_tsquery('english', %s)
             LIMIT 500
-        )
-        SELECT m.doc_id, m.paragraph_summary, m.one_sentence_summary,
-               m.category, m.date_range_earliest, m.date_range_latest, c.rank
-        FROM candidates c
-        JOIN all_embeddings_mv m ON m.doc_id = c.doc_id
-        ORDER BY c.rank DESC
+        ) AS candidates
+        ORDER BY rank DESC
         LIMIT %s
     """, [tsquery, tsquery, limit])
 
@@ -1056,24 +1141,40 @@ def get_graph_overview(limit: int = 30) -> dict:
 
 def get_relationships_for_actor(actor: str, limit: int = 50) -> list[dict]:
     """Get relationships involving an actor."""
+    # Trigram index requires at least 3 characters for efficiency
+    if len(actor.strip()) < 3:
+        return []
+
     conn = get_db()
     cursor = conn.cursor()
 
     if _is_postgres():
-        # Requête optimisée avec UNION pour utiliser les index trigram
+        # Optimized query: fetch limited candidates first, then deduplicate
+        # This avoids sorting millions of rows when search term is common
         cursor.execute("""
+            WITH actor_matches AS (
+                SELECT doc_id, timestamp, actor, action, target, location, explicit_topic, implicit_topic
+                FROM rdf_triples
+                WHERE actor ILIKE %s
+                LIMIT %s
+            ),
+            target_matches AS (
+                SELECT doc_id, timestamp, actor, action, target, location, explicit_topic, implicit_topic
+                FROM rdf_triples
+                WHERE target ILIKE %s
+                LIMIT %s
+            ),
+            combined AS (
+                SELECT * FROM actor_matches
+                UNION
+                SELECT * FROM target_matches
+            )
             SELECT DISTINCT ON (doc_id)
                 doc_id, timestamp, actor, action, target, location, explicit_topic, implicit_topic
-            FROM (
-                SELECT doc_id, timestamp, actor, action, target, location, explicit_topic, implicit_topic
-                FROM rdf_triples WHERE actor ILIKE %s
-                UNION ALL
-                SELECT doc_id, timestamp, actor, action, target, location, explicit_topic, implicit_topic
-                FROM rdf_triples WHERE target ILIKE %s
-            ) AS sub
+            FROM combined
             ORDER BY doc_id, timestamp
             LIMIT %s
-        """, [f"%{actor}%", f"%{actor}%", limit])
+        """, [f"%{actor}%", limit * 2, f"%{actor}%", limit * 2, limit])
     else:
         cursor.execute("""
             SELECT DISTINCT doc_id, timestamp, actor, action, target, location, explicit_topic, implicit_topic
@@ -1294,11 +1395,17 @@ def search_actor(actor_name: str, limit: int = 50) -> str:
 @mcp.tool()
 def get_stats() -> str:
     """
-    Get database statistics.
+    Get database statistics (cached for 1 week).
 
     Returns:
         Total documents, relationships, actors, and search capabilities.
     """
+    global _stats_cache
+
+    # Check cache
+    if _stats_cache["data"] and (time.time() - _stats_cache["timestamp"]) < STATS_CACHE_TTL:
+        return _stats_cache["data"]
+
     conn = get_db()
 
     stats = {
@@ -1319,7 +1426,12 @@ def get_stats() -> str:
     stats["categories"] = [{"name": row[0], "count": row[1]} for row in cursor]
 
     conn.close()
-    return json.dumps(stats, indent=2)
+
+    # Update cache
+    result = json.dumps(stats, indent=2)
+    _stats_cache = {"data": result, "timestamp": time.time()}
+
+    return result
 
 
 @mcp.tool()

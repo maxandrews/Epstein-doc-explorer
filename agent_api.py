@@ -6,6 +6,7 @@ Provides an agentic RAG system that can search, analyze, and answer
 questions about the Epstein document corpus.
 """
 
+import asyncio
 import json
 import logging
 import operator
@@ -20,7 +21,7 @@ from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -189,7 +190,7 @@ async def verify_api_key(x_api_key: str = Header(None, alias="X-API-Key")):
 
 
 @tool
-def search_documents(query: str, limit: int = 10) -> str:
+async def search_documents(query: str, limit: int = 10) -> str:
     """
     Search documents using semantic similarity with PGVector.
     Use this to find documents related to a topic, person, or event.
@@ -199,12 +200,12 @@ def search_documents(query: str, limit: int = 10) -> str:
         query: Natural language search query (e.g., "meetings with politicians", "flights to the island")
         limit: Maximum number of results to return (default 10)
     """
-    results = semantic_search(query, limit)
+    results = await asyncio.to_thread(semantic_search, query, limit)
     return json.dumps(results, indent=2, ensure_ascii=False)
 
 
 @tool
-def search_actor(actor_name: str, limit: int = 50) -> str:
+async def search_actor(actor_name: str, limit: int = 50) -> str:
     """
     Get all relationships involving a specific person/actor.
     Use this to find what actions a person took or what happened to them.
@@ -213,22 +214,14 @@ def search_actor(actor_name: str, limit: int = 50) -> str:
         actor_name: Name of the person (e.g., "Bill Clinton", "Ghislaine Maxwell", "Prince Andrew")
         limit: Maximum number of relationships to return
     """
-    results = get_relationships_for_actor(actor_name, limit)
+    results = await asyncio.to_thread(get_relationships_for_actor, actor_name, limit)
     return json.dumps(results, indent=2, ensure_ascii=False)
 
 
-@tool
-def get_document(doc_id: str) -> str:
-    """
-    Get the full text of a specific document.
-    Use this when you need to read the complete content of a document.
-
-    Args:
-        doc_id: Document ID (e.g., "HOUSE_OVERSIGHT_010568")
-    """
+def _get_document_sync(doc_id: str) -> str:
+    """Sync helper for get_document."""
     text = get_document_text(doc_id)
     if text:
-        # Limiter la taille pour éviter de surcharger le contexte
         if len(text) > 8000:
             return text[:8000] + "\n\n[... document tronqué, utilisez une recherche plus spécifique ...]"
         return text
@@ -236,7 +229,19 @@ def get_document(doc_id: str) -> str:
 
 
 @tool
-def search_by_keywords(keywords: str, limit: int = 10) -> str:
+async def get_document(doc_id: str) -> str:
+    """
+    Get the full text of a specific document.
+    Use this when you need to read the complete content of a document.
+
+    Args:
+        doc_id: Document ID (e.g., "HOUSE_OVERSIGHT_010568")
+    """
+    return await asyncio.to_thread(_get_document_sync, doc_id)
+
+
+@tool
+async def search_by_keywords(keywords: str, limit: int = 10) -> str:
     """
     Search documents by keywords using PostgreSQL full-text search.
     Uses tsvector and ts_rank for intelligent ranking. Fast and accurate.
@@ -246,12 +251,12 @@ def search_by_keywords(keywords: str, limit: int = 10) -> str:
         limit: Maximum number of results to return
     """
     keyword_list = [k.strip() for k in keywords.split(",")]
-    results = keyword_search(keyword_list, limit)
+    results = await asyncio.to_thread(keyword_search, keyword_list, limit)
     return json.dumps(results, indent=2, ensure_ascii=False)
 
 
 @tool
-def search_hybrid(query: str, keywords: str = "", limit: int = 10) -> str:
+async def search_hybrid(query: str, keywords: str = "", limit: int = 10) -> str:
     """
     Hybrid search combining semantic similarity and keyword relevance with MRR scoring.
     Best results when you have both a natural language query and specific keywords.
@@ -265,16 +270,12 @@ def search_hybrid(query: str, keywords: str = "", limit: int = 10) -> str:
         limit: Maximum number of results to return
     """
     keyword_list = [k.strip() for k in keywords.split(",")] if keywords.strip() else None
-    results = hybrid_search(query, keyword_list, limit)
+    results = await asyncio.to_thread(hybrid_search, query, keyword_list, limit)
     return json.dumps(results, indent=2, ensure_ascii=False)
 
 
-@tool
-def get_database_stats() -> str:
-    """
-    Get statistics about the document database.
-    Use this to understand the scope and content of the corpus.
-    """
+def _get_database_stats_sync() -> str:
+    """Sync helper for get_database_stats."""
     conn = get_db()
     cursor = conn.cursor()
 
@@ -310,6 +311,15 @@ def get_database_stats() -> str:
     cursor.close()
     conn.close()
     return json.dumps(stats, indent=2, ensure_ascii=False)
+
+
+@tool
+async def get_database_stats() -> str:
+    """
+    Get statistics about the document database.
+    Use this to understand the scope and content of the corpus.
+    """
+    return await asyncio.to_thread(_get_database_stats_sync)
 
 
 @tool
@@ -672,9 +682,20 @@ async def get_document_endpoint(doc_id: str, _: str = Depends(verify_api_key)):
     raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
 
 
-@app.get("/api/stats")
-async def get_stats():
-    """Get database statistics."""
+_stats_cache = {"data": None, "timestamp": 0}
+STATS_CACHE_TTL = 604800  # 1 semaine
+
+
+def _get_stats_sync():
+    """Synchronous stats fetch - runs in thread pool with caching."""
+    import time
+
+    # Return cached if still valid
+    if _stats_cache["data"] and (time.time() - _stats_cache["timestamp"]) < STATS_CACHE_TTL:
+        logger.info("Returning cached stats")
+        return _stats_cache["data"]
+
+    logger.info("Fetching fresh stats from DB...")
     conn = get_db()
     cursor = conn.cursor()
 
@@ -690,6 +711,9 @@ async def get_stats():
     row = cursor.fetchone()
     total_documents = row["count"] if isinstance(row, dict) else row[0]
 
+    cursor.close()
+    conn.close()
+
     stats = {
         "total_documents": total_documents,
         "total_relationships": total_rels,
@@ -697,8 +721,19 @@ async def get_stats():
         "search_backend": "PGVector (PostgreSQL)" if DATABASE_URL else "NumPy (SQLite fallback)",
     }
 
-    cursor.close()
-    conn.close()
+    # Update cache
+    _stats_cache["data"] = stats
+    _stats_cache["timestamp"] = time.time()
+    logger.info("Stats cached")
+
+    return stats
+
+
+@app.get("/api/stats")
+async def get_stats():
+    """Get database statistics."""
+    loop = asyncio.get_event_loop()
+    stats = await loop.run_in_executor(None, _get_stats_sync)
     return stats
 
 
@@ -887,8 +922,31 @@ async def query_documents(request: QueryRequest, _: str = Depends(verify_api_key
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def iter_with_disconnect(async_iter, http_request, timeout=120):
+    """Wrapper that checks for client disconnect between iterations."""
+    iterator = async_iter.__aiter__()
+    while True:
+        # Check disconnect before waiting for next item
+        if await http_request.is_disconnected():
+            logger.info("Client disconnected, stopping iteration")
+            return
+        try:
+            # Wait for next item with timeout
+            item = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
+            yield item
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            logger.warning("Stream iteration timeout after %ds", timeout)
+            return
+
+
 @app.post("/api/query/stream")
-async def query_documents_stream(request: QueryRequest, _: str = Depends(verify_api_key)):
+async def query_documents_stream(
+    request: QueryRequest,
+    http_request: Request,
+    _: str = Depends(verify_api_key)
+):
     """
     Stream the agent's response for real-time UI updates.
     Returns Server-Sent Events (SSE).
@@ -898,11 +956,12 @@ async def query_documents_stream(request: QueryRequest, _: str = Depends(verify_
 
     async def generate():
         try:
-            async for event in agent.astream_events(
+            stream = agent.astream_events(
                 {"messages": [HumanMessage(content=request.question)]},
                 config=config,
                 version="v2",
-            ):
+            )
+            async for event in iter_with_disconnect(stream, http_request):
                 event_type = event.get("event", "")
 
                 # Streaming des tokens de réponse
@@ -1020,6 +1079,9 @@ async def query_documents_stream(request: QueryRequest, _: str = Depends(verify_
             logger.info("Sending done event, closing stream")
             yield f"data: {json.dumps({'type': 'done', 'conversation_title': conversation_title}, ensure_ascii=False)}\n\n"
 
+        except asyncio.CancelledError:
+            logger.info("Client disconnected, stopping stream for session %s", request.session_id)
+            return
         except Exception as e:
             logger.exception("Erreur /api/query/stream: %s", e)
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"

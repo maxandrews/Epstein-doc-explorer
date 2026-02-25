@@ -12,4 +12,4 @@ cmds = [
 cacheDirectories = ["/app/.venv"]
 
 [start]
-cmd = "/app/.venv/bin/uvicorn agent_api:app --host 0.0.0.0 --port ${PORT:-8000}"
+cmd = "/app/.venv/bin/uvicorn agent_api:app --host 0.0.0.0 --port ${PORT:-8000} --workers 4 --timeout-keep-alive 30"
