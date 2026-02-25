@@ -145,6 +145,7 @@ from mcp_server import (
     get_subgraph_for_persons,
     find_shortest_path,
     search_persons_neo4j,
+    get_graph_overview,
     _is_neo4j_available,
 )
 
@@ -601,6 +602,32 @@ class GraphData(BaseModel):
     found: bool = True
 
 
+class OverviewNode(BaseModel):
+    id: str
+    label: str
+    degree: int = 0
+
+
+class OverviewEdge(BaseModel):
+    source: str
+    target: str
+    weight: int = 1
+    actions: list[str] = []
+    doc_ids: list[str] = []
+
+
+class OverviewMeta(BaseModel):
+    total_displayed_nodes: int = 0
+    total_displayed_edges: int = 0
+    total_edges_in_graph: int = 0
+
+
+class GraphOverviewResponse(BaseModel):
+    nodes: list[OverviewNode]
+    edges: list[OverviewEdge]
+    meta: OverviewMeta
+
+
 class QueryResponse(BaseModel):
     answer: str
     sources: list[SourceInfo]
@@ -678,6 +705,26 @@ async def get_stats():
     cursor.close()
     conn.close()
     return stats
+
+
+@app.get("/api/graph/overview", response_model=GraphOverviewResponse)
+async def graph_overview(limit: int = 30):
+    """
+    Get a simplified overview of the relationship graph.
+    Returns the top N most-connected persons (canonical names) and their inter-connections.
+    Uses PostgreSQL rdf_triples + entity_aliases for name resolution.
+    Designed for initial graph rendering — progressive detail is loaded via expand endpoints.
+    """
+    result = get_graph_overview(limit=min(limit, 100))
+
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    return GraphOverviewResponse(
+        nodes=[OverviewNode(**n) for n in result["nodes"]],
+        edges=[OverviewEdge(**e) for e in result["edges"]],
+        meta=OverviewMeta(**result["meta"]),
+    )
 
 
 @app.post("/api/search/semantic")

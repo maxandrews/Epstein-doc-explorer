@@ -778,6 +778,131 @@ def search_persons_neo4j(query: str, limit: int = 20) -> list[dict]:
         return [{"name": r["name"], "connections": r["connections"]} for r in result]
 
 
+import time as _time
+
+_graph_overview_cache: dict[int, tuple[float, dict]] = {}
+_GRAPH_OVERVIEW_TTL = 7 * 24 * 3600  # 1 week
+
+
+def get_graph_overview(limit: int = 30) -> dict:
+    """
+    Get a high-level overview of the graph using PostgreSQL: the top N
+    most-connected persons (canonical names) and all relationships between them.
+
+    Uses rdf_triples joined with entity_aliases to resolve canonical names,
+    so actors like "Epstein", "Jeffrey Epstein", "J. Epstein" are merged.
+
+    Results are cached in memory for 1 week (data is static).
+
+    Args:
+        limit: Number of top persons to include (default 30)
+
+    Returns:
+        Graph structure with nodes (top persons) and edges (relations between them)
+    """
+    now = _time.monotonic()
+    cached = _graph_overview_cache.get(limit)
+    if cached and (now - cached[0]) < _GRAPH_OVERVIEW_TTL:
+        return cached[1]
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # Step 1: Get the top N most-connected canonical persons
+    # Count appearances as either actor or target (canonical)
+    cursor.execute("""
+        WITH canonical_mentions AS (
+            SELECT COALESCE(ea.canonical_name, r.actor) AS person
+            FROM rdf_triples r
+            LEFT JOIN entity_aliases ea ON ea.original_name = r.actor
+            UNION ALL
+            SELECT COALESCE(ea.canonical_name, r.target) AS person
+            FROM rdf_triples r
+            LEFT JOIN entity_aliases ea ON ea.original_name = r.target
+        )
+        SELECT person, COUNT(*) AS degree
+        FROM canonical_mentions
+        GROUP BY person
+        ORDER BY degree DESC
+        LIMIT %s
+    """, (limit,))
+
+    top_persons = []
+    nodes_map = {}
+    for row in cursor:
+        name = row["person"]
+        degree = row["degree"]
+        top_persons.append(name)
+        nodes_map[name] = {
+            "id": name,
+            "label": name,
+            "degree": degree,
+        }
+
+    if not top_persons:
+        cursor.close()
+        conn.close()
+        return {"nodes": [], "edges": [], "meta": {"total_displayed": 0}}
+
+    # Step 2: Get all relationships between these top persons (aggregated)
+    # Resolve actor and target to canonical names, then filter pairs within top list
+    cursor.execute("""
+        WITH resolved AS (
+            SELECT
+                COALESCE(ea_a.canonical_name, r.actor) AS source,
+                COALESCE(ea_t.canonical_name, r.target) AS target,
+                r.action,
+                r.doc_id
+            FROM rdf_triples r
+            LEFT JOIN entity_aliases ea_a ON ea_a.original_name = r.actor
+            LEFT JOIN entity_aliases ea_t ON ea_t.original_name = r.target
+        )
+        SELECT
+            LEAST(source, target) AS source,
+            GREATEST(source, target) AS target,
+            COUNT(*) AS weight,
+            array_agg(DISTINCT action) FILTER (WHERE action IS NOT NULL) AS actions,
+            array_agg(DISTINCT doc_id) FILTER (WHERE doc_id IS NOT NULL) AS doc_ids
+        FROM resolved
+        WHERE source IN %s AND target IN %s
+          AND source != target
+        GROUP BY LEAST(source, target), GREATEST(source, target)
+        ORDER BY weight DESC
+    """, (tuple(top_persons), tuple(top_persons)))
+
+    edges = []
+    for row in cursor:
+        edges.append({
+            "source": row["source"],
+            "target": row["target"],
+            "weight": row["weight"],
+            "actions": row["actions"] or [],
+            "doc_ids": row["doc_ids"] or [],
+        })
+
+    # Step 3: Total edges in the whole graph
+    cursor.execute("SELECT COUNT(*) AS total FROM rdf_triples")
+    total_edges = cursor.fetchone()["total"]
+
+    cursor.close()
+    conn.close()
+
+    nodes = sorted(nodes_map.values(), key=lambda x: x["degree"], reverse=True)
+
+    result = {
+        "nodes": nodes,
+        "edges": edges,
+        "meta": {
+            "total_displayed_nodes": len(nodes),
+            "total_displayed_edges": len(edges),
+            "total_edges_in_graph": total_edges,
+        },
+    }
+
+    _graph_overview_cache[limit] = (_time.monotonic(), result)
+    return result
+
+
 # ==================== PostgreSQL Relationship Queries ====================
 
 def get_relationships_for_actor(actor: str, limit: int = 50) -> list[dict]:
