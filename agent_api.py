@@ -141,12 +141,11 @@ from mcp_server import (
     get_relationships_for_actor,
     get_db,
     DATABASE_URL,
-    # Neo4j graph functions
+    # Graph functions (PostgreSQL-based)
     get_subgraph_for_persons,
     find_shortest_path,
-    search_persons_neo4j,
+    search_persons,
     get_graph_overview,
-    _is_neo4j_available,
 )
 
 # ============== FastAPI App ==============
@@ -167,18 +166,14 @@ app.add_middleware(
 
 
 @app.on_event("startup")
-async def warmup_neo4j():
-    """Warm up Neo4j connection and cache on startup."""
-    if _is_neo4j_available():
-        logger.info("Warming up Neo4j cache...")
-        try:
-            # Run a simple query to warm up the connection and cache
-            get_subgraph_for_persons(["Jeffrey Epstein"], depth=1, limit=5)
-            logger.info("Neo4j cache warmed up successfully")
-        except Exception as e:
-            logger.warning("Neo4j warmup failed: %s", e)
-    else:
-        logger.info("Neo4j not configured, skipping warmup")
+async def warmup_graph_cache():
+    """Warm up graph overview cache on startup."""
+    logger.info("Warming up graph overview cache...")
+    try:
+        get_graph_overview(limit=30)
+        logger.info("Graph overview cache warmed up successfully")
+    except Exception as e:
+        logger.warning("Graph cache warmup failed: %s", e)
 
 
 # API Key pour sécuriser les endpoints
@@ -320,7 +315,7 @@ def get_database_stats() -> str:
 @tool
 def get_connection_graph(persons: str, depth: int = 1) -> str:
     """
-    Get a graph of connections between people from Neo4j.
+    Get a graph of connections between people using PostgreSQL with canonical name resolution.
     Use this when the user asks about relationships, connections, or links between people.
     Returns a graph structure that can be visualized.
 
@@ -478,7 +473,7 @@ Your capabilities:
 - Hybrid search combining semantic + keywords with MRR scoring
 - Exploring relationships between people (who did what to whom)
 - Reading full document text
-- **Graph visualization of connections between people (Neo4j)**
+- **Graph visualization of connections between people (PostgreSQL with canonical name resolution)**
 
 Instructions:
 1. Use search tools to find relevant information
@@ -952,6 +947,24 @@ async def query_documents_stream(request: QueryRequest, _: str = Depends(verify_
                                 "found": parsed.get("found", True),
                                 "depth": parsed.get("depth")
                             }
+                            # Extract sources from graph edges doc_ids (cap to 20 to keep streaming fast)
+                            max_graph_sources = 20
+                            for edge in parsed.get("edges", []):
+                                if len(sources) >= max_graph_sources:
+                                    break
+                                doc_id = edge.get("doc_id")
+                                if not doc_id or doc_id in seen_doc_ids:
+                                    continue
+                                seen_doc_ids.add(doc_id)
+                                doc_data = get_document_with_metadata(doc_id)
+                                sources.append({
+                                    "doc_id": doc_id,
+                                    "summary": doc_data.get("one_sentence_summary") if doc_data else None,
+                                    "category": doc_data.get("category") if doc_data else None,
+                                    "date_range": doc_data.get("date_range") if doc_data else None,
+                                    "full_text": doc_data.get("full_text") if doc_data else None,
+                                    "image_url": generate_presigned_url(doc_id),
+                                })
                         elif isinstance(parsed, list):
                             for item in parsed:
                                 if isinstance(item, dict) and "doc_id" in item:

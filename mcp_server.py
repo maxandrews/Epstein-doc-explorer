@@ -555,133 +555,263 @@ def get_document_with_metadata(doc_id: str) -> dict | None:
     return None
 
 
-# ==================== Neo4j Connection ====================
+# ==================== Graph Queries (PostgreSQL) ====================
 
-NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD")
+def _resolve_persons(cursor, persons: list[str]) -> list[str]:
+    """
+    Resolve input names to canonical names as stored in rdf_triples.actor_canonical / target_canonical.
+    Uses entity_aliases for lookup, with ILIKE fallback.
+    Returns deduplicated canonical names.
+    """
+    canonical = set()
+    unresolved = []
 
-_neo4j_driver = None
-
-
-def get_neo4j_driver():
-    """Get Neo4j driver (lazy loaded)."""
-    global _neo4j_driver
-    if _neo4j_driver is None and NEO4J_PASSWORD:
-        from neo4j import GraphDatabase
-        _neo4j_driver = GraphDatabase.driver(
-            NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD)
+    for p in persons:
+        # Fast: exact PK lookup on entity_aliases
+        cursor.execute(
+            "SELECT canonical_name FROM entity_aliases WHERE original_name = %s",
+            (p,),
         )
-    return _neo4j_driver
+        row = cursor.fetchone()
+        if row:
+            canonical.add(row["canonical_name"])
+            continue
 
+        # Fast: maybe the input IS already a canonical name
+        cursor.execute(
+            "SELECT 1 FROM rdf_triples WHERE actor_canonical = %s LIMIT 1",
+            (p,),
+        )
+        if cursor.fetchone():
+            canonical.add(p)
+            continue
 
-def _is_neo4j_available() -> bool:
-    """Check if Neo4j is configured and available."""
-    driver = get_neo4j_driver()
-    if driver is None:
-        return False
-    try:
-        driver.verify_connectivity()
-        return True
-    except Exception:
-        return False
+        unresolved.append(p)
 
+    # ILIKE fallback for unresolved names
+    if unresolved:
+        like_clauses = []
+        params = []
+        for p in unresolved:
+            like_clauses.append("actor_canonical ILIKE %s")
+            params.append(f"%{p}%")
+        cursor.execute(
+            f"SELECT DISTINCT actor_canonical FROM rdf_triples WHERE {' OR '.join(like_clauses)} LIMIT 10",
+            params,
+        )
+        for row in cursor:
+            canonical.add(row["actor_canonical"])
 
-# ==================== Neo4j Graph Queries ====================
+    return list(canonical) if canonical else persons
+
 
 def get_subgraph_for_persons(persons: list[str], depth: int = 1, limit: int = 50) -> dict:
     """
-    Get a subgraph centered around specific persons.
+    Build a focused subgraph showing how the queried persons relate.
+
+    Multi-person strategy (single optimised SQL):
+      1. Direct links between queried persons
+      2. Best shared connection (1 intermediary connecting any pair)
+      3. Top distinct connections per person as complement
+
+    Single-person: returns their top connections directly.
 
     Args:
         persons: List of person names to center the graph around
-        depth: How many hops to include (1 = direct connections only)
-        limit: Maximum number of relationships to return
-
-    Returns:
-        Graph structure with nodes and edges
+        depth: unused (kept for API compat) — intermediary logic replaces it
+        limit: Max relationships to return
     """
-    driver = get_neo4j_driver()
-    if not driver:
-        return {"error": "Neo4j not configured", "nodes": [], "edges": []}
+    conn = get_db()
+    cursor = conn.cursor()
 
-    with driver.session() as session:
-        # Use fulltext index for fast person lookup
-        search_query = " OR ".join(persons)
+    canonical_names = _resolve_persons(cursor, persons)
+    if not canonical_names:
+        cursor.close()
+        conn.close()
+        return {"nodes": [], "edges": [], "queried_persons": persons, "depth": depth}
 
-        result = session.run("""
-            CALL db.index.fulltext.queryNodes('person_search', $search_query)
-            YIELD node as p, score
-            WHERE score > 0.5
-            WITH p
-            LIMIT 10
-            MATCH (p)-[rel:RELATION]-(connected:Person)
-            WITH p, connected, rel
-            LIMIT $edge_limit
-            RETURN p.name as source_name,
-                   connected.name as target_name,
-                   rel.action as action,
-                   rel.doc_id as doc_id,
-                   rel.timestamp as timestamp,
-                   rel.location as location,
-                   rel.topic as topic
-        """, search_query=search_query, edge_limit=limit)
+    queried_set = {c.lower() for c in canonical_names}
+    nodes_map = {}
+    edges = []
+    seen = set()
 
-        nodes_map = {}
-        edges = []
+    def _add(row):
+        key = (row["source"], row["target"], row["doc_id"])
+        if key in seen:
+            return
+        seen.add(key)
+        for p in (row["source"], row["target"]):
+            if p not in nodes_map:
+                nodes_map[p] = {"id": p, "label": p, "connections": 0}
+            nodes_map[p]["connections"] += 1
+        edges.append({
+            "source": row["source"], "target": row["target"],
+            "action": row["action"], "doc_id": row["doc_id"],
+            "timestamp": row.get("timestamp"), "location": row.get("location"),
+            "topic": row.get("topic"),
+        })
 
-        for record in result:
-            source = record["source_name"]
-            target = record["target_name"]
+    ct = tuple(canonical_names)
 
-            # Add nodes
-            if source not in nodes_map:
-                nodes_map[source] = {
-                    "id": source,
-                    "label": source,
-                    "connections": 0
-                }
-            if target not in nodes_map:
-                nodes_map[target] = {
-                    "id": target,
-                    "label": target,
-                    "connections": 0
-                }
+    # === 1. Direct links between queried persons ===
+    if len(canonical_names) >= 2:
+        cursor.execute("""
+            SELECT actor_canonical AS source, target_canonical AS target,
+                   action, doc_id, timestamp, location,
+                   COALESCE(explicit_topic, implicit_topic) AS topic
+            FROM rdf_triples
+            WHERE actor_canonical IN %s AND target_canonical IN %s
+              AND actor_canonical != target_canonical
+            LIMIT %s
+        """, (ct, ct, limit))
+        for row in cursor:
+            _add(row)
 
-            nodes_map[source]["connections"] += 1
-            nodes_map[target]["connections"] += 1
+        # === 2. Best shared connection per pair (max 1 intermediary) ===
+        # Single query: for each pair (a, b), find the top-1 shared neighbour
+        # Uses a lateral join for efficiency — PostgreSQL optimises this well
+        from itertools import combinations
+        for a, b in combinations(canonical_names, 2):
+            cursor.execute("""
+                SELECT sub.shared, sub.a_action, sub.a_doc_id, sub.b_action, sub.b_doc_id
+                FROM (
+                    SELECT
+                        t1.target_canonical AS shared,
+                        t1.action AS a_action, t1.doc_id AS a_doc_id,
+                        t2.action AS b_action, t2.doc_id AS b_doc_id
+                    FROM rdf_triples t1
+                    JOIN rdf_triples t2 ON t1.target_canonical = t2.target_canonical
+                    WHERE t1.actor_canonical = %s AND t2.actor_canonical = %s
+                      AND t1.target_canonical != %s AND t1.target_canonical != %s
+                      AND t1.actor_canonical != t1.target_canonical
+                    LIMIT 1
+                ) sub
+            """, (a, b, a, b))
+            row = cursor.fetchone()
+            if row:
+                _add({"source": a, "target": row["shared"],
+                      "action": row["a_action"], "doc_id": row["a_doc_id"]})
+                _add({"source": b, "target": row["shared"],
+                      "action": row["b_action"], "doc_id": row["b_doc_id"]})
 
-            # Add edge
-            edges.append({
-                "source": source,
-                "target": target,
-                "action": record["action"],
-                "doc_id": record["doc_id"],
-                "timestamp": record["timestamp"],
-                "location": record["location"],
-                "topic": record["topic"]
-            })
+    # === 3. Top 5 connections per person ranked by exchange count ===
+    top_n = 5
+    # Filter out non-person entries (generic labels, emails, orgs)
+    noise_filter = """
+        AND {col} !~ '@'
+        AND {col} NOT IN (
+            'email','communication','unknown','recipient','transaction',
+            'DOJ document','Confidential Document','document'
+        )
+    """
+    for person in canonical_names:
+        # Find top 5 most connected persons (by number of exchanges)
+        actor_filter = noise_filter.format(col="target_canonical")
+        target_filter = noise_filter.format(col="actor_canonical")
+        cursor.execute(f"""
+            SELECT connected, SUM(cnt) AS total FROM (
+                SELECT target_canonical AS connected, COUNT(*) AS cnt
+                FROM rdf_triples
+                WHERE actor_canonical = %s AND actor_canonical != target_canonical
+                {actor_filter}
+                GROUP BY target_canonical
+                UNION ALL
+                SELECT actor_canonical AS connected, COUNT(*) AS cnt
+                FROM rdf_triples
+                WHERE target_canonical = %s AND actor_canonical != target_canonical
+                {target_filter}
+                GROUP BY actor_canonical
+            ) sub
+            GROUP BY connected
+            ORDER BY total DESC
+            LIMIT %s
+        """, (person, person, top_n))
+        top_connections = [(row["connected"], row["total"]) for row in cursor]
 
-        # Mark queried persons
-        for name in nodes_map:
-            for person in persons:
-                if person.lower() in name.lower():
-                    nodes_map[name]["is_queried"] = True
-                    break
+        if not top_connections:
+            continue
 
-        nodes = sorted(nodes_map.values(), key=lambda x: x["connections"], reverse=True)
+        # Pre-populate exchange_count on nodes for top connections
+        for connected_name, exchange_count in top_connections:
+            if connected_name not in nodes_map:
+                nodes_map[connected_name] = {"id": connected_name, "label": connected_name, "connections": 0}
+            # Keep max exchange_count if shared between multiple queried persons
+            prev = nodes_map[connected_name].get("exchange_count", 0)
+            nodes_map[connected_name]["exchange_count"] = max(prev, int(exchange_count))
+
+        # Fetch a sample of edges per top connection (max 10 each)
+        per_conn = 10
+        for connected_name, _ in top_connections:
+            cursor.execute("""
+                (SELECT actor_canonical AS source, target_canonical AS target,
+                        action, doc_id, timestamp, location,
+                        COALESCE(explicit_topic, implicit_topic) AS topic
+                 FROM rdf_triples
+                 WHERE actor_canonical = %s AND target_canonical = %s
+                 LIMIT %s)
+                UNION ALL
+                (SELECT actor_canonical AS source, target_canonical AS target,
+                        action, doc_id, timestamp, location,
+                        COALESCE(explicit_topic, implicit_topic) AS topic
+                 FROM rdf_triples
+                 WHERE actor_canonical = %s AND target_canonical = %s
+                 LIMIT %s)
+            """, (person, connected_name, per_conn, connected_name, person, per_conn))
+            for row in cursor:
+                _add(row)
+
+    for name in nodes_map:
+        if name.lower() in queried_set:
+            nodes_map[name]["is_queried"] = True
+
+    nodes = sorted(nodes_map.values(), key=lambda x: x["connections"], reverse=True)
+    cursor.close()
+    conn.close()
 
     return {
-        "nodes": nodes,
-        "edges": edges,
-        "queried_persons": persons,
-        "depth": depth
+        "nodes": nodes, "edges": edges,
+        "queried_persons": persons, "depth": depth,
     }
+
+
+def _get_neighbours(cursor, names: set[str], per_person: int = 100) -> dict[str, list[tuple[str, str, str]]]:
+    """
+    For a set of canonical names, return their direct neighbours.
+    Returns {person: [(neighbour, action, doc_id), ...]}.
+    Queries each person separately with a LIMIT to avoid huge result sets.
+    """
+    if not names:
+        return {}
+
+    neighbours: dict[str, list[tuple[str, str, str]]] = {}
+    for person in names:
+        cursor.execute("""
+            (SELECT actor_canonical AS source, target_canonical AS target,
+                    action, doc_id
+             FROM rdf_triples
+             WHERE actor_canonical = %s AND actor_canonical != target_canonical
+             LIMIT %s)
+            UNION
+            (SELECT actor_canonical AS source, target_canonical AS target,
+                    action, doc_id
+             FROM rdf_triples
+             WHERE target_canonical = %s AND actor_canonical != target_canonical
+             LIMIT %s)
+        """, (person, per_person, person, per_person))
+
+        for row in cursor:
+            s, t = row["source"], row["target"]
+            neighbours.setdefault(s, []).append((t, row["action"], row["doc_id"]))
+            neighbours.setdefault(t, []).append((s, row["action"], row["doc_id"]))
+
+    return neighbours
 
 
 def find_shortest_path(person1: str, person2: str, max_depth: int = 5) -> dict:
     """
     Find the shortest connection path between two persons.
+    Bidirectional BFS driven from Python — each hop only queries the frontier
+    neighbours via indexed actor_canonical / target_canonical lookups.
 
     Args:
         person1: Name of first person
@@ -691,67 +821,110 @@ def find_shortest_path(person1: str, person2: str, max_depth: int = 5) -> dict:
     Returns:
         Path information with nodes and edges
     """
-    driver = get_neo4j_driver()
-    if not driver:
-        return {"error": "Neo4j not configured", "path": None}
+    conn = get_db()
+    cursor = conn.cursor()
 
-    with driver.session() as session:
-        # Use fulltext index for fast person lookup
-        result = session.run("""
-            CALL db.index.fulltext.queryNodes('person_search', $person1) YIELD node as start, score as s1
-            WHERE s1 > 0.5
-            WITH start
-            LIMIT 1
-            CALL db.index.fulltext.queryNodes('person_search', $person2) YIELD node as end, score as s2
-            WHERE s2 > 0.5
-            WITH start, end
-            LIMIT 1
-            MATCH path = shortestPath((start)-[r:RELATION*1..5]-(end))
-            RETURN [n IN nodes(path) | n.name] as node_names,
-                   [r IN relationships(path) | {
-                       action: r.action,
-                       doc_id: r.doc_id
-                   }] as relationships
-            LIMIT 1
-        """, person1=person1, person2=person2)
+    resolved = _resolve_persons(cursor, [person1, person2])
+    start = resolved[0] if len(resolved) >= 1 else person1
+    end = resolved[1] if len(resolved) >= 2 else (resolved[0] if len(resolved) == 1 else person2)
 
-        record = result.single()
-        if not record:
-            return {
-                "found": False,
-                "person1": person1,
-                "person2": person2,
-                "message": f"No path found between {person1} and {person2} within {max_depth} hops"
-            }
-
-        node_names = record["node_names"]
-        relationships = record["relationships"]
-
-        # Build nodes and edges
-        nodes = [{"id": name, "label": name} for name in node_names]
-        edges = []
-
-        for i, rel in enumerate(relationships):
-            edges.append({
-                "source": node_names[i],
-                "target": node_names[i + 1],
-                "action": rel["action"],
-                "doc_id": rel["doc_id"]
-            })
-
+    if start.lower() == end.lower():
+        cursor.close()
+        conn.close()
         return {
-            "found": True,
-            "person1": person1,
-            "person2": person2,
-            "path_length": len(relationships),
-            "nodes": nodes,
-            "edges": edges
+            "found": True, "person1": person1, "person2": person2,
+            "path_length": 0,
+            "nodes": [{"id": start, "label": start}], "edges": [],
         }
 
+    # Bidirectional BFS — expand the smaller frontier each step
+    parent_fwd = {start: None}
+    parent_bwd = {end: None}
+    frontier_fwd = {start}
+    frontier_bwd = {end}
+    meeting_node = None
 
-def search_persons_neo4j(query: str, limit: int = 20) -> list[dict]:
+    for _ in range(max_depth):
+        if len(frontier_fwd) <= len(frontier_bwd):
+            nbrs = _get_neighbours(cursor, frontier_fwd)
+            next_frontier = set()
+            for node in frontier_fwd:
+                for (neighbour, action, doc_id) in nbrs.get(node, []):
+                    if neighbour in parent_fwd:
+                        continue
+                    parent_fwd[neighbour] = (node, action, doc_id)
+                    next_frontier.add(neighbour)
+                    if neighbour in parent_bwd:
+                        meeting_node = neighbour
+                        break
+                if meeting_node:
+                    break
+            frontier_fwd = next_frontier
+        else:
+            nbrs = _get_neighbours(cursor, frontier_bwd)
+            next_frontier = set()
+            for node in frontier_bwd:
+                for (neighbour, action, doc_id) in nbrs.get(node, []):
+                    if neighbour in parent_bwd:
+                        continue
+                    parent_bwd[neighbour] = (node, action, doc_id)
+                    next_frontier.add(neighbour)
+                    if neighbour in parent_fwd:
+                        meeting_node = neighbour
+                        break
+                if meeting_node:
+                    break
+            frontier_bwd = next_frontier
+
+        if meeting_node:
+            break
+        if not frontier_fwd and not frontier_bwd:
+            break
+
+    cursor.close()
+    conn.close()
+
+    if not meeting_node:
+        return {
+            "found": False, "person1": person1, "person2": person2,
+            "message": f"No path found between {start} and {end} within {max_depth} hops",
+        }
+
+    # Reconstruct path: start → meeting_node → end
+    path_fwd, edges_fwd = [], []
+    node = meeting_node
+    while parent_fwd[node] is not None:
+        prev, action, doc_id = parent_fwd[node]
+        path_fwd.append(node)
+        edges_fwd.append({"source": prev, "target": node, "action": action, "doc_id": doc_id})
+        node = prev
+    path_fwd.append(start)
+    path_fwd.reverse()
+    edges_fwd.reverse()
+
+    path_bwd, edges_bwd = [], []
+    node = meeting_node
+    while parent_bwd[node] is not None:
+        prev, action, doc_id = parent_bwd[node]
+        path_bwd.append(prev)
+        edges_bwd.append({"source": node, "target": prev, "action": action, "doc_id": doc_id})
+        node = prev
+
+    full_path = path_fwd + path_bwd
+    full_edges = edges_fwd + edges_bwd
+
+    return {
+        "found": True, "person1": person1, "person2": person2,
+        "path_length": len(full_edges),
+        "nodes": [{"id": n, "label": n} for n in full_path],
+        "edges": full_edges,
+    }
+
+
+def search_persons(query: str, limit: int = 20) -> list[dict]:
     """
-    Search for persons by name in Neo4j.
+    Search for persons by name using actor_canonical / target_canonical columns.
+    Single query, no JOINs.
 
     Args:
         query: Search query (partial name match)
@@ -760,22 +933,30 @@ def search_persons_neo4j(query: str, limit: int = 20) -> list[dict]:
     Returns:
         List of matching persons with connection counts
     """
-    driver = get_neo4j_driver()
-    if not driver:
-        return []
+    conn = get_db()
+    cursor = conn.cursor()
 
-    with driver.session() as session:
-        result = session.run("""
-            MATCH (p:Person)
-            WHERE p.name =~ $pattern
-            WITH p
-            MATCH (p)-[r:RELATION]-()
-            RETURN p.name as name, count(r) as connections
-            ORDER BY connections DESC
-            LIMIT $limit
-        """, pattern=f"(?i).*{query}.*", limit=limit)
+    cursor.execute("""
+        SELECT person, SUM(cnt) AS connections FROM (
+            SELECT actor_canonical AS person, COUNT(*) AS cnt
+            FROM rdf_triples
+            WHERE actor_canonical ILIKE %s
+            GROUP BY actor_canonical
+            UNION ALL
+            SELECT target_canonical AS person, COUNT(*) AS cnt
+            FROM rdf_triples
+            WHERE target_canonical ILIKE %s
+            GROUP BY target_canonical
+        ) sub
+        GROUP BY person
+        ORDER BY connections DESC
+        LIMIT %s
+    """, (f"%{query}%", f"%{query}%", limit))
 
-        return [{"name": r["name"], "connections": r["connections"]} for r in result]
+    results = [{"name": row["person"], "connections": row["connections"]} for row in cursor]
+    cursor.close()
+    conn.close()
+    return results
 
 
 import time as _time
@@ -786,19 +967,9 @@ _GRAPH_OVERVIEW_TTL = 7 * 24 * 3600  # 1 week
 
 def get_graph_overview(limit: int = 30) -> dict:
     """
-    Get a high-level overview of the graph using PostgreSQL: the top N
-    most-connected persons (canonical names) and all relationships between them.
-
-    Uses rdf_triples joined with entity_aliases to resolve canonical names,
-    so actors like "Epstein", "Jeffrey Epstein", "J. Epstein" are merged.
-
-    Results are cached in memory for 1 week (data is static).
-
-    Args:
-        limit: Number of top persons to include (default 30)
-
-    Returns:
-        Graph structure with nodes (top persons) and edges (relations between them)
+    Top N most-connected persons and their inter-connections.
+    Direct queries on actor_canonical / target_canonical — no JOINs.
+    Cached in memory for 1 week (data is static).
     """
     now = _time.monotonic()
     cached = _graph_overview_cache.get(limit)
@@ -808,20 +979,13 @@ def get_graph_overview(limit: int = 30) -> dict:
     conn = get_db()
     cursor = conn.cursor()
 
-    # Step 1: Get the top N most-connected canonical persons
-    # Count appearances as either actor or target (canonical)
+    # Step 1: Top N persons by mention count
     cursor.execute("""
-        WITH canonical_mentions AS (
-            SELECT COALESCE(ea.canonical_name, r.actor) AS person
-            FROM rdf_triples r
-            LEFT JOIN entity_aliases ea ON ea.original_name = r.actor
+        SELECT person, COUNT(*) AS degree FROM (
+            SELECT actor_canonical AS person FROM rdf_triples
             UNION ALL
-            SELECT COALESCE(ea.canonical_name, r.target) AS person
-            FROM rdf_triples r
-            LEFT JOIN entity_aliases ea ON ea.original_name = r.target
-        )
-        SELECT person, COUNT(*) AS degree
-        FROM canonical_mentions
+            SELECT target_canonical AS person FROM rdf_triples
+        ) sub
         GROUP BY person
         ORDER BY degree DESC
         LIMIT %s
@@ -830,45 +994,30 @@ def get_graph_overview(limit: int = 30) -> dict:
     top_persons = []
     nodes_map = {}
     for row in cursor:
-        name = row["person"]
-        degree = row["degree"]
+        name, degree = row["person"], row["degree"]
         top_persons.append(name)
-        nodes_map[name] = {
-            "id": name,
-            "label": name,
-            "degree": degree,
-        }
+        nodes_map[name] = {"id": name, "label": name, "degree": degree}
 
     if not top_persons:
         cursor.close()
         conn.close()
         return {"nodes": [], "edges": [], "meta": {"total_displayed": 0}}
 
-    # Step 2: Get all relationships between these top persons (aggregated)
-    # Resolve actor and target to canonical names, then filter pairs within top list
+    # Step 2: Edges between top persons (aggregated, undirected)
+    top_tuple = tuple(top_persons)
     cursor.execute("""
-        WITH resolved AS (
-            SELECT
-                COALESCE(ea_a.canonical_name, r.actor) AS source,
-                COALESCE(ea_t.canonical_name, r.target) AS target,
-                r.action,
-                r.doc_id
-            FROM rdf_triples r
-            LEFT JOIN entity_aliases ea_a ON ea_a.original_name = r.actor
-            LEFT JOIN entity_aliases ea_t ON ea_t.original_name = r.target
-        )
         SELECT
-            LEAST(source, target) AS source,
-            GREATEST(source, target) AS target,
+            LEAST(actor_canonical, target_canonical) AS source,
+            GREATEST(actor_canonical, target_canonical) AS target,
             COUNT(*) AS weight,
             array_agg(DISTINCT action) FILTER (WHERE action IS NOT NULL) AS actions,
             array_agg(DISTINCT doc_id) FILTER (WHERE doc_id IS NOT NULL) AS doc_ids
-        FROM resolved
-        WHERE source IN %s AND target IN %s
-          AND source != target
-        GROUP BY LEAST(source, target), GREATEST(source, target)
+        FROM rdf_triples
+        WHERE actor_canonical IN %s AND target_canonical IN %s
+          AND actor_canonical != target_canonical
+        GROUP BY LEAST(actor_canonical, target_canonical), GREATEST(actor_canonical, target_canonical)
         ORDER BY weight DESC
-    """, (tuple(top_persons), tuple(top_persons)))
+    """, (top_tuple, top_tuple))
 
     edges = []
     for row in cursor:

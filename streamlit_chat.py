@@ -337,7 +337,7 @@ if prompt := st.chat_input("Posez votre question..."):
                                     with tool_container:
                                         st.info(f"🔧 Appel: **{tool_name}**")
 
-                                elif event_type == "tool_end":
+                                elif event_type in ("tool_end", "graph"):
                                     tool_name = event.get("tool_name", "unknown")
                                     sources = event.get("sources", [])
 
@@ -353,7 +353,12 @@ if prompt := st.chat_input("Posez votre question..."):
                                             all_sources.append(src)
 
                                     with tool_container:
-                                        if sources:
+                                        if event_type == "graph":
+                                            graph = event.get("graph", {})
+                                            n_nodes = len(graph.get("nodes", []))
+                                            n_edges = len(graph.get("edges", []))
+                                            st.success(f"✓ {tool_name} - {n_nodes} personnes, {n_edges} liens, {len(sources)} doc(s)")
+                                        elif sources:
                                             st.success(f"✓ {tool_name} - {len(sources)} doc(s) trouvé(s)")
                                         else:
                                             st.success(f"✓ {tool_name}")
