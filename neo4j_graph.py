@@ -282,7 +282,7 @@ def get_subgraph_for_persons(persons: list[str], depth: int = 1, limit: int = 50
 
 # ============== Expand Node ==============
 
-def expand_node(person: str, limit: int = 20) -> dict:
+def expand_node(person: str, limit: int = 50) -> dict:
     """
     Expand a single node to show its top connections.
     Used when clicking on a node in the graph.
@@ -308,7 +308,7 @@ def expand_node(person: str, limit: int = 20) -> dict:
             MATCH (p:Person {name: $person})-[r:RELATION]-(other:Person)
             WHERE other.name <> $person
             WITH other, r
-            LIMIT 5000
+            LIMIT 10000
             WITH other.name AS other_name,
                  count(r) AS weight,
                  collect(DISTINCT r.action)[0..5] AS actions,
