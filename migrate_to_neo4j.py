@@ -86,16 +86,22 @@ def migrate_relationships(driver, batch_size: int = 1000):
     pg_conn = get_postgres_conn()
     cursor = pg_conn.cursor()
 
-    # Count total relationships
-    cursor.execute("SELECT COUNT(*) as cnt FROM rdf_triples")
+    # Count total relationships (excluding self-loops and null canonicals)
+    cursor.execute("""
+        SELECT COUNT(*) as cnt FROM rdf_triples
+        WHERE actor_canonical IS NOT NULL AND target_canonical IS NOT NULL
+          AND actor_canonical != target_canonical
+    """)
     total = cursor.fetchone()["cnt"]
     logger.info("Total relationships to migrate: %d", total)
 
-    # Fetch all relationships
+    # Fetch all relationships using canonical names
     cursor.execute("""
-        SELECT doc_id, timestamp, actor, action, target, location,
+        SELECT doc_id, timestamp, actor_canonical, action, target_canonical, location,
                explicit_topic, implicit_topic
         FROM rdf_triples
+        WHERE actor_canonical IS NOT NULL AND target_canonical IS NOT NULL
+          AND actor_canonical != target_canonical
         ORDER BY doc_id
     """)
 
@@ -104,8 +110,8 @@ def migrate_relationships(driver, batch_size: int = 1000):
 
     for row in cursor:
         batch.append({
-            "actor": row["actor"],
-            "target": row["target"],
+            "actor": row["actor_canonical"],
+            "target": row["target_canonical"],
             "action": row["action"],
             "doc_id": row["doc_id"],
             "timestamp": row["timestamp"],

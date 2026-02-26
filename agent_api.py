@@ -142,11 +142,16 @@ from mcp_server import (
     get_relationships_for_actor,
     get_db,
     DATABASE_URL,
-    # Graph functions (PostgreSQL-based)
+)
+
+# Graph functions (Neo4j-based)
+from neo4j_graph import (
     get_subgraph_for_persons,
     find_shortest_path,
     search_persons,
     get_graph_overview,
+    expand_node,
+    get_graph_stats,
 )
 
 # ============== FastAPI App ==============
@@ -325,9 +330,9 @@ async def get_database_stats() -> str:
 @tool
 def get_connection_graph(persons: str, depth: int = 1) -> str:
     """
-    Get a graph of connections between people using PostgreSQL with canonical name resolution.
+    Get a graph of connections between people using Neo4j.
     Use this when the user asks about relationships, connections, or links between people.
-    Returns a graph structure that can be visualized.
+    Returns a graph structure with edge weights (for visualizing connection strength).
 
     IMPORTANT: Use this tool for ANY question about:
     - connections between people ("quelle connexion entre X et Y")
@@ -335,6 +340,8 @@ def get_connection_graph(persons: str, depth: int = 1) -> str:
     - links ("lien entre...")
     - how people are connected
     - network of a person
+
+    Edge weight indicates how many times two people appear together (thicker = more frequent).
 
     Args:
         persons: Comma-separated names of people (e.g., "Bill Clinton, Jeffrey Epstein")
@@ -483,7 +490,7 @@ Your capabilities:
 - Hybrid search combining semantic + keywords with MRR scoring
 - Exploring relationships between people (who did what to whom)
 - Reading full document text
-- **Graph visualization of connections between people (PostgreSQL with canonical name resolution)**
+- **Graph visualization of connections between people (Neo4j graph database)**
 
 Instructions:
 1. Use search tools to find relevant information
@@ -596,7 +603,9 @@ class GraphEdge(BaseModel):
     label: str | None = None
     doc_id: str | None = None
     doc_ids: list[str] = []
+    actions: list[str] = []
     count: int = 1
+    weight: int = 1  # For edge thickness visualization
 
 
 class GraphData(BaseModel):
@@ -631,6 +640,28 @@ class GraphOverviewResponse(BaseModel):
     nodes: list[OverviewNode]
     edges: list[OverviewEdge]
     meta: OverviewMeta
+
+
+class ExpandNode(BaseModel):
+    id: str
+    label: str
+    connections: int = 0
+    is_center: bool = False
+
+
+class ExpandEdge(BaseModel):
+    source: str
+    target: str
+    weight: int = 1
+    actions: list[str] = []
+    doc_ids: list[str] = []
+
+
+class ExpandResponse(BaseModel):
+    nodes: list[ExpandNode]
+    edges: list[ExpandEdge]
+    center_person: str
+    found: bool = True
 
 
 class QueryResponse(BaseModel):
@@ -740,10 +771,10 @@ async def get_stats():
 @app.get("/api/graph/overview", response_model=GraphOverviewResponse)
 async def graph_overview(limit: int = 30):
     """
-    Get a simplified overview of the relationship graph.
-    Returns the top N most-connected persons (canonical names) and their inter-connections.
-    Uses PostgreSQL rdf_triples + entity_aliases for name resolution.
-    Designed for initial graph rendering — progressive detail is loaded via expand endpoints.
+    Get a simplified overview of the relationship graph from Neo4j.
+    Returns the top N most-connected persons and their inter-connections.
+    Edge weights indicate connection frequency (for edge thickness visualization).
+    Designed for initial graph rendering — expand nodes on click for details.
     """
     result = get_graph_overview(limit=min(limit, 100))
 
@@ -755,6 +786,52 @@ async def graph_overview(limit: int = 30):
         edges=[OverviewEdge(**e) for e in result["edges"]],
         meta=OverviewMeta(**result["meta"]),
     )
+
+
+@app.get("/api/graph/expand/{person}", response_model=ExpandResponse)
+async def graph_expand(person: str, limit: int = 20):
+    """
+    Expand a node to show its top connections.
+    Use this when clicking on a person node in the graph visualization.
+
+    Returns the person's most frequent connections with edge weights.
+    Edge weight represents how many times these two people appear together
+    (use for edge thickness: higher weight = thicker line).
+
+    Args:
+        person: Name of the person to expand
+        limit: Maximum number of connections to return (default 20)
+    """
+    result = expand_node(person, limit=min(limit, 50))
+
+    if not result.get("found", True):
+        raise HTTPException(status_code=404, detail=f"Person not found: {person}")
+
+    return ExpandResponse(
+        nodes=[ExpandNode(**n) for n in result["nodes"]],
+        edges=[ExpandEdge(**e) for e in result["edges"]],
+        center_person=result["center_person"],
+        found=result["found"],
+    )
+
+
+@app.get("/api/graph/search")
+async def graph_search(q: str, limit: int = 20):
+    """
+    Search for persons by name in the Neo4j graph.
+
+    Args:
+        q: Search query (partial name match)
+        limit: Maximum number of results (default 20)
+    """
+    results = search_persons(q, limit=min(limit, 50))
+    return {"results": results, "query": q}
+
+
+@app.get("/api/graph/stats")
+async def graph_stats_endpoint():
+    """Get statistics about the Neo4j graph."""
+    return get_graph_stats()
 
 
 @app.post("/api/search/semantic")
@@ -866,7 +943,9 @@ async def query_documents(request: QueryRequest, _: str = Depends(verify_api_key
                                 label=e.get("label"),
                                 doc_id=e.get("doc_id"),
                                 doc_ids=e.get("doc_ids", []),
-                                count=e.get("count", 1)
+                                actions=e.get("actions", []),
+                                count=e.get("count", 1),
+                                weight=e.get("weight", 1),
                             )
                             for e in content.get("edges", [])
                         ]
