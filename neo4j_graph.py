@@ -144,13 +144,13 @@ def search_persons(query: str, limit: int = 20) -> list[dict]:
         # Use CONTAINS for partial matching (case-insensitive)
         result = session.run("""
             MATCH (p:Person)
-            WHERE toLower(p.name) CONTAINS toLower($query)
+            WHERE toLower(p.name) CONTAINS toLower($search_term)
             WITH p
             MATCH (p)-[r:RELATION]-()
             RETURN p.name AS name, count(r) AS connections
             ORDER BY connections DESC
-            LIMIT $limit
-        """, query=query, limit=limit)
+            LIMIT $max_results
+        """, search_term=query, max_results=limit)
 
         return [{"name": record["name"], "connections": record["connections"]} for record in result]
 
@@ -406,17 +406,43 @@ def find_shortest_path(person1: str, person2: str, max_depth: int = 5) -> dict:
 
         nodes = [{"id": name, "label": name} for name in node_names]
         edges = []
-        for i, rel in enumerate(rel_data):
-            source, target = node_names[i], node_names[i + 1]
-            if source > target:
-                source, target = target, source
-            edges.append({
-                "source": source,
-                "target": target,
-                "action": rel["action"],
-                "doc_id": rel["doc_id"],
-                "weight": 1,
-            })
+
+        # For direct connections (1 hop), get ALL documents connecting the two persons
+        if len(rel_data) == 1:
+            all_docs_result = session.run("""
+                MATCH (a:Person {name: $start})-[r:RELATION]-(b:Person {name: $end})
+                RETURN collect(DISTINCT r.doc_id) AS doc_ids,
+                       collect(DISTINCT r.action) AS actions,
+                       count(r) AS weight
+            """, start=start, end=end)
+
+            all_docs_record = all_docs_result.single()
+            if all_docs_record:
+                source, target = start, end
+                if source > target:
+                    source, target = target, source
+                edges.append({
+                    "source": source,
+                    "target": target,
+                    "action": rel_data[0]["action"],
+                    "doc_ids": all_docs_record["doc_ids"][:50],  # Limit to 50 docs
+                    "actions": all_docs_record["actions"][:10],
+                    "weight": all_docs_record["weight"],
+                })
+        else:
+            # For multi-hop paths, keep single doc per edge
+            for i, rel in enumerate(rel_data):
+                source, target = node_names[i], node_names[i + 1]
+                if source > target:
+                    source, target = target, source
+                edges.append({
+                    "source": source,
+                    "target": target,
+                    "action": rel["action"],
+                    "doc_id": rel["doc_id"],
+                    "doc_ids": [rel["doc_id"]] if rel["doc_id"] else [],
+                    "weight": 1,
+                })
 
         return {
             "found": True,

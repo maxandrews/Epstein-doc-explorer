@@ -834,6 +834,33 @@ async def graph_stats_endpoint():
     return get_graph_stats()
 
 
+class ShortestPathResponse(BaseModel):
+    found: bool
+    person1: str
+    person2: str
+    path_length: int | None = None
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    message: str | None = None
+
+
+@app.get("/api/graph/shortest-path", response_model=ShortestPathResponse)
+async def shortest_path_endpoint(person1: str, person2: str, max_depth: int = 5):
+    """
+    Find the shortest path between two persons in the Neo4j graph.
+
+    Args:
+        person1: Name of the first person
+        person2: Name of the second person
+        max_depth: Maximum number of hops to search (default 5)
+
+    Returns:
+        Path information with nodes and edges, or not found message
+    """
+    result = find_shortest_path(person1, person2, max_depth=min(max_depth, 10))
+    return ShortestPathResponse(**result)
+
+
 @app.post("/api/search/semantic")
 async def semantic_search_endpoint(request: SearchRequest, _: str = Depends(verify_api_key)):
     """
