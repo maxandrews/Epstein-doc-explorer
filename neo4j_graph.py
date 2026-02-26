@@ -303,9 +303,12 @@ def expand_node(person: str, limit: int = 20) -> dict:
         edges = []
 
         # Get top connections with aggregated weights
+        # Sample first to avoid memory issues with high-degree nodes
         result = session.run("""
             MATCH (p:Person {name: $person})-[r:RELATION]-(other:Person)
             WHERE other.name <> $person
+            WITH other, r
+            LIMIT 5000
             WITH other.name AS other_name,
                  count(r) AS weight,
                  collect(DISTINCT r.action)[0..5] AS actions,
